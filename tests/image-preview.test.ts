@@ -162,8 +162,9 @@ test('the cell aspect is measured from the terminal and previews are centered', 
   // 2:1 picture at 2.5: 5 columns per row, so 20 rows hold 100 columns
   expect(img?.props.columns).toBe(100)
   expect(img?.props.rows).toBe(20)
+  // centered in the 112-column budget: 5 + (112 - 100) / 2
   const boxes = await ui.findAll({ type: 'Box' })
-  expect(boxes.some(b => b.props.justifyContent === 'center')).toBe(true)
+  expect(boxes.some(b => b.props.paddingLeft === 11)).toBe(true)
 })
 
 test('a font zoom mid-session is measured again', async ($, on) => {
@@ -182,4 +183,20 @@ test('a bogus pixel report keeps the default aspect', async ($, on) => {
   engine(on)
   terminal(on, { now: '64 204 1633 200' })
   expect((await (await mountCat($, 120)).find({ type: 'Image' }))?.props.columns).toBe(80)
+})
+
+test('a folded group centers its previews too', async ($, on) => {
+  engine(on)
+  terminal(on, { now: '64 204 1633 1281' })
+  const call = (p: string, output: unknown) => ({ tool: 'Read', input: { file_path: p }, isRunning: false, isErrored: false, isInterrupted: false, output })
+  const ui = await $.ui.mount({
+    plugin: 'image-preview', surface: 'terminal', component: 'ToolGroup',
+    props: { calls: [call('/a/logo.png', pngOutput)], isActive: false, isExpanded: false } as any,
+    viewport: VIEW,
+  })
+  expect((await ui.find({ type: 'Image' }))?.props.columns).toBe(100)
+  // the padding is computed, so it holds however wide the engine makes the group's container
+  const boxes = await ui.findAll({ type: 'Box' })
+  expect(boxes.some(b => b.props.paddingLeft === 11)).toBe(true)
+  expect(boxes.some(b => b.props.alignItems === 'center' || b.props.justifyContent === 'center')).toBe(false)
 })

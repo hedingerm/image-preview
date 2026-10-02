@@ -19,6 +19,7 @@ const PANE = 'image-preview'
 const MIN_ROWS = 4 // shortest inline preview, in terminal cells
 const MAX_ROWS = 20 // tallest inline preview, in terminal cells
 const INDENT = 8 // cells left of an inline preview (Claude Code's gutter + our padding)
+const PAD = 5 // our padding: previews start under the row's text
 const DEFAULT_CELL_ASPECT = 2 // a cell's height over its width when the terminal doesn't say (8x16 px)
 const MAX_PNG_BYTES = 2 * 1024 * 1024 // what an Image element takes inline
 const GROUP_LIMIT = 4 // previews drawn under one folded group of reads
@@ -83,6 +84,14 @@ function cellsFor(p: Picture, maxColumns: number, maxRows: number): { columns: n
   return rowsByWidth <= maxRows
     ? { columns: clamp(maxColumns, maxColumns), rows: clamp(rowsByWidth, maxRows) }
     : { columns: clamp(maxRows * columnsPerRow, maxColumns), rows: clamp(maxRows, maxRows) }
+}
+
+/**
+ * Left padding that centers `columns` cells in the inline budget. Computed, like Grok's `pad_x`, rather
+ * than left to flex centering: a folded group's container is only as wide as its content.
+ */
+function centerPad(columns: number, maxColumns: number): number {
+  return PAD + Math.max(0, Math.floor((maxColumns - columns) / 2))
 }
 
 /** Inline preview budget for a terminal `columns` wide: full content width, height clamp(width / 2, 4, 20). */
@@ -329,14 +338,17 @@ export const register: Register = on => {
     await syncCellAspect($, e.viewport?.columns)
     const { maxColumns, maxRows } = inlineBudget(e.viewport?.columns)
 
-    const below = preview.ok
-      ? Image({ source: { png: preview.picture.png }, ...cellsFor(preview.picture, maxColumns, maxRows), alt: baseName(path) })
-      : Text({ dimColor: true, children: [`no preview: ${preview.reason}`] })
-
-    return Box({
-      flexDirection: 'column',
-      children: [row, Box({ paddingLeft: 5, justifyContent: 'center', children: [below] })],
+    if (!preview.ok) {
+      const reason = Text({ dimColor: true, children: [`no preview: ${preview.reason}`] })
+      return Box({ flexDirection: 'column', children: [row, Box({ paddingLeft: PAD, children: [reason] })] })
+    }
+    const size = cellsFor(preview.picture, maxColumns, maxRows)
+    const below = Box({
+      paddingLeft: centerPad(size.columns, maxColumns),
+      children: [Image({ source: { png: preview.picture.png }, ...size, alt: baseName(path) })],
     })
+
+    return Box({ flexDirection: 'column', children: [row, below] })
   })
 
   // A folded "Read N files" line: previews of its images under it.
@@ -356,17 +368,22 @@ export const register: Register = on => {
     for (const call of images) {
       const path = readPath(call.input) as string
       const preview = await previewFor($, path, call.output)
-      previews.push(Text({ dimColor: true, children: [baseName(path)] }))
+      const label = Text({ dimColor: true, children: [baseName(path)] })
+      if (!preview.ok) {
+        previews.push(Box({ flexDirection: 'column', paddingLeft: PAD, children: [label, Text({ dimColor: true, children: [`no preview: ${preview.reason}`] })] }))
+        continue
+      }
+      // the name sits over the picture's left edge
+      const size = cellsFor(preview.picture, maxColumns, maxRows)
       previews.push(
-        preview.ok
-          ? Image({ source: { png: preview.picture.png }, ...cellsFor(preview.picture, maxColumns, maxRows), alt: baseName(path) })
-          : Text({ dimColor: true, children: [`no preview: ${preview.reason}`] }),
+        Box({
+          flexDirection: 'column',
+          paddingLeft: centerPad(size.columns, maxColumns),
+          children: [label, Image({ source: { png: preview.picture.png }, ...size, alt: baseName(path) })],
+        }),
       )
     }
 
-    return Box({
-      flexDirection: 'column',
-      children: [row, Box({ flexDirection: 'column', paddingLeft: 5, alignItems: 'center', children: previews })],
-    })
+    return Box({ flexDirection: 'column', children: [row, ...previews] })
   })
 }
