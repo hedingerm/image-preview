@@ -11,9 +11,11 @@ Inline image previews for Claude Code in Ghostty and kitty. When Claude reads an
 Requires Claude Code 2.1.287 or later, since mods are still early access.
 
 ```
-/plugin marketplace add hedingerm/image-preview
-/plugin install image-preview@image-preview
+/plugin marketplace add hedingerm/claude-plugins
+/plugin install image-preview@hedingerm
 ```
+
+It's listed in [hedingerm/claude-plugins](https://github.com/hedingerm/claude-plugins), my marketplace for Claude Code plugins.
 
 Start a new session, then check it loaded with `/plugin` (Installed tab), or just type `/img`.
 
