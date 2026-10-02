@@ -1,0 +1,16 @@
+{
+  "name": "image-preview",
+  "owner": { "name": "Manuel Hedinger" },
+  "metadata": { "description": "Inline image previews for Claude Code in Ghostty and kitty" },
+  "plugins": [
+    {
+      "name": "image-preview",
+      "source": "./",
+      "description": "Inline image previews in the terminal (Ghostty, kitty): under every image Claude reads, and on demand with /img",
+      "version": "0.2.0",
+      "author": { "name": "Manuel Hedinger" },
+      "category": "productivity",
+      "keywords": ["images", "preview", "ghostty", "kitty", "terminal"]
+    }
+  ]
+}

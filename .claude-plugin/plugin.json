@@ -1,0 +1,10 @@
+{
+  "name": "image-preview",
+  "version": "0.2.0",
+  "description": "Inline image previews in the terminal (Ghostty, kitty): under every image Claude reads, and on demand with /img",
+  "author": { "name": "Manuel Hedinger" },
+  "homepage": "https://github.com/hedingerm/image-preview",
+  "repository": "https://github.com/hedingerm/image-preview",
+  "license": "MIT",
+  "keywords": ["images", "preview", "ghostty", "kitty", "terminal", "mod"]
+}
