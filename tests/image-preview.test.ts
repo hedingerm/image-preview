@@ -200,3 +200,79 @@ test('a folded group centers its previews too', async ($, on) => {
   expect(boxes.some(b => b.props.paddingLeft === 11)).toBe(true)
   expect(boxes.some(b => b.props.alignItems === 'center' || b.props.justifyContent === 'center')).toBe(false)
 })
+
+// Claude Code's files for this test session: its images folder and what's in it
+const IMAGES = '/home/you/.claude/projects/-work-app/sess-1/images'
+function pasteFolder(on: On, files: string[], draft: { text: string }) {
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/you' : undefined }))
+  on('session.cwd', () => ({ value: '/work/app' }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('prompt.read', () => ({ value: { text: draft.text, cursor: draft.text.length } }))
+  on('fs.exists', (_$, e) => ({ value: e.path === IMAGES || files.includes(e.path) }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 200, mtimeMs: 3, isLink: false } }))
+  on('fs.read', () => ({ value: { base64: PNG } }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+}
+
+const startSession = ($: Parameters<TestBody>[0]) =>
+  $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+
+const mountBand = ($: Parameters<TestBody>[0], surface: 'terminal' | 'desktop' = 'terminal') =>
+  $.ui.mount({
+    plugin: 'image-preview', surface, component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 100, scroll: { bodyRows: 20 }, view: {} } as any,
+    viewport: VIEW,
+  })
+
+test('images pasted into the draft get thumbnails above the prompt', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on)
+  const draft = { text: '' }
+  pasteFolder(on, [`${IMAGES}/1.png`, `${IMAGES}/2.png`], draft)
+  await startSession($)
+
+  await clock.advance(500)
+  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+
+  draft.text = 'what is wrong here [Image #1] and [Image #2]'
+  await clock.advance(500)
+  const band = await mountBand($)
+  const thumbs = await band.findAll({ type: 'Image' })
+  expect(thumbs.map(t => t.props.alt)).toEqual(['[Image #1]', '[Image #2]'])
+  // 2:1 picture in a thumbnail at most 6 rows tall
+  expect(thumbs[0]?.props.rows).toBe(6)
+  expect(thumbs[0]?.props.columns).toBe(24)
+
+  // deleting the placeholder removes the thumbnail
+  draft.text = 'what is wrong here [Image #2]'
+  await clock.advance(500)
+  expect((await (await mountBand($)).findAll({ type: 'Image' })).map(t => t.props.alt)).toEqual(['[Image #2]'])
+})
+
+test('pasted thumbnails wait for the file, clear on submit and honor /img off', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on)
+  const files: string[] = []
+  const draft = { text: 'look [Image #1]' }
+  pasteFolder(on, files, draft)
+  await startSession($)
+
+  await clock.advance(500)
+  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+  files.push(`${IMAGES}/1.png`) // Claude Code finished writing it
+  await clock.advance(500)
+  expect(await (await mountBand($)).find({ type: 'Image' })).toBeDefined()
+  // the desktop app shows its own
+  expect(await (await mountBand($, 'desktop')).find({ type: 'Image' })).toBeUndefined()
+
+  await $.command.run(typed('off'))
+  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+  await $.command.run(typed('on'))
+  expect(await (await mountBand($)).find({ type: 'Image' })).toBeDefined()
+
+  await $.prompt.submit({ text: 'look [Image #1]', wait: false, origin: { kind: 'composer' } })
+  draft.text = ''
+  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+})

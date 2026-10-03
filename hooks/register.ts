@@ -1,12 +1,16 @@
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+
+import type { PastedImage } from '../types'
 
 // ---------------------------------------------------------------------------
 // image-preview: inline image previews for Claude Code in Ghostty / kitty.
 //
 // - Every image Claude opens with the Read tool gets a preview under its row
 //   (standalone rows and folded "Read N files" groups alike).
+// - Images pasted into the prompt get thumbnails above it while you write.
 // - /img <path>   opens any image in a pane (Esc closes it)
-// - /img off|on   turns the inline previews off or on (remembered)
+// - /img off|on   turns the inline and pasted previews off or on (remembered)
 //
 // Pictures go out through Claude Code's own `Image` element, which speaks the
 // kitty graphics protocol where the terminal has it and draws the alt text
@@ -24,6 +28,16 @@ const DEFAULT_CELL_ASPECT = 2 // a cell's height over its width when the termina
 const MAX_PNG_BYTES = 2 * 1024 * 1024 // what an Image element takes inline
 const GROUP_LIMIT = 4 // previews drawn under one folded group of reads
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif|svg)$/i
+const THUMB_ROWS = 6 // tallest thumbnail of a pasted image above the prompt
+const THUMB_LIMIT = 6 // thumbnails drawn above the prompt; the rest are counted
+const THUMB_GAP = 2 // cells between thumbnails
+const POLL_MS = 400 // how often the draft is checked for pasted images
+// Claude Code writes a pasted image to <config>/projects/<project>/<session>/images/<n>.<ext>
+const PASTE_EXTS = ['png', 'jpg', 'gif', 'webp']
+const PASTE_TAG = /\[Image #(\d+)\]/g
+
+// the images the draft in the prompt box refers to, drawn above it
+const pasted = atom({ plugin: 'image-preview', key: 'pasted' } as const, [] as PastedImage[])
 
 type Picture = { png: string; width: number; height: number }
 type Preview = { ok: true; picture: Picture } | { ok: false; reason: string }
@@ -35,6 +49,10 @@ let isInlineOn = true
 let cellAspect = DEFAULT_CELL_ASPECT
 let measuredAt: number | undefined // viewport columns at the last measurement
 let panePath: string | undefined
+// session id -> its images folder, and "session:n" -> the file of [Image #n]
+const imageDirs = new Map<string, string>()
+const pastePaths = new Map<string, string>()
+let poll: { cancel: () => void } | undefined // the timer that checks the draft
 
 // ---------- small helpers (no $) ----------
 
@@ -108,6 +126,25 @@ function hash(text: string): string {
 
 function baseName(path: string): string {
   return path.split('/').pop() || path
+}
+
+/** The ids of the `[Image #n]` placeholders in a draft, in order, once each. */
+function pastedIds(text: string): number[] {
+  const ids: number[] = []
+  for (const m of text.matchAll(PASTE_TAG)) {
+    const id = Number(m[1])
+    if (!ids.includes(id)) ids.push(id)
+  }
+  return ids
+}
+
+/** Claude Code's folder name for a project: every character outside [a-zA-Z0-9] becomes '-'. */
+function projectSlug(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-')
+}
+
+function samePasted(a: readonly PastedImage[], b: readonly PastedImage[]): boolean {
+  return a.length === b.length && a.every((p, i) => p.id === b[i]?.id && p.path === b[i]?.path)
 }
 
 function readPath(input: unknown): string | undefined {
@@ -213,6 +250,74 @@ async function previewFor($: EngineInterface, path: string, output: unknown): Pr
   return loadPicture($, path)
 }
 
+/** The folder this session's pasted images are written to, or undefined when there is none yet. */
+async function pasteDir($: EngineInterface, session: string): Promise<string | undefined> {
+  if (imageDirs.get(session)) return imageDirs.get(session)
+  const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || ((await $.env.get('HOME')) ?? '') + '/.claude').replace(/\/$/, '')
+  const projects = config + '/projects'
+  const guess = `${projects}/${projectSlug(await $.session.cwd())}/${session}/images`
+  let dir: string | undefined
+  if (await $.fs.exists(guess)) {
+    dir = guess
+  } else {
+    // a long or moved project path is named differently: look for the session's folder
+    try {
+      for (const entry of await $.fs.list(projects)) {
+        const candidate = `${projects}/${entry.name}/${session}/images`
+        if (entry.kind === 'dir' && (await $.fs.exists(candidate))) {
+          dir = candidate
+          break
+        }
+      }
+    } catch {
+      // no projects folder
+    }
+  }
+  // remember a hit only: the folder appears with the session's first paste
+  if (dir) imageDirs.set(session, dir)
+  return dir
+}
+
+/** The file Claude Code wrote for `[Image #id]`, once it has. */
+async function pastePath($: EngineInterface, session: string, id: number): Promise<string | undefined> {
+  const key = `${session}:${id}`
+  const known = pastePaths.get(key)
+  if (known) return known
+  const dir = await pasteDir($, session)
+  if (!dir) return undefined
+  for (const ext of PASTE_EXTS) {
+    const path = `${dir}/${id}.${ext}`
+    if (await $.fs.exists(path)) {
+      pastePaths.set(key, path)
+      return path
+    }
+  }
+  return undefined
+}
+
+/** The draft in the prompt box; '' where there is none. */
+async function draftText($: EngineInterface): Promise<string> {
+  try {
+    return (await $.prompt.read()).text
+  } catch {
+    return ''
+  }
+}
+
+/** Points the band above the prompt at the images `draft` refers to. */
+async function syncPasted($: EngineInterface, draft: string): Promise<void> {
+  const ids = isInlineOn ? pastedIds(draft) : []
+  const found: PastedImage[] = []
+  if (ids.length > 0) {
+    const session = await $.session.id()
+    for (const id of ids) {
+      const path = await pastePath($, session, id)
+      if (path) found.push({ id, path })
+    }
+  }
+  if (!samePasted(found, await read($, pasted))) await update($, pasted, () => found)
+}
+
 // Children have no controlling tty, so walk up to Claude Code's process and ask
 // its tty for the window's pixel size (TIOCGWINSZ), the way Grok Build does.
 const MEASURE_CELL = `
@@ -266,7 +371,32 @@ export const register: Register = on => {
     })
     const saved = await $.store.get('inline')
     if (typeof saved === 'boolean') isInlineOn = saved
+    // A paste reaches the draft by more than one path, so the draft is also checked on a timer
+    let isSyncing = false
+    poll?.cancel()
+    poll = $.clock.every(POLL_MS, async () => {
+      if (isSyncing) return
+      isSyncing = true
+      try {
+        await syncPasted($, await draftText($))
+      } finally {
+        isSyncing = false
+      }
+    })
     return next(e)
+  })
+
+  on('prompt.edit', async ($, e, next) => {
+    const box = await next(e)
+    await syncPasted($, box.text)
+    return box
+  })
+
+  // The draft leaves the box when it's sent
+  on('prompt.submit', async ($, e, next) => {
+    const result = await next(e)
+    await update($, pasted, () => [])
+    return result
   })
 
   on('command.run', { command: 'img' }, async ($, e) => {
@@ -275,6 +405,7 @@ export const register: Register = on => {
     if (arg === 'on' || arg === 'off') {
       isInlineOn = arg === 'on'
       await $.store.set('inline', isInlineOn)
+      await syncPasted($, await draftText($))
       $.ui.invalidate('ui.render')
       return { text: `Inline image previews ${isInlineOn ? 'on' : 'off'}.` }
     }
@@ -283,7 +414,7 @@ export const register: Register = on => {
       return {
         text:
           `Inline previews are ${isInlineOn ? 'on' : 'off'}. ` +
-          'Usage: /img <path> to open an image, /img on|off to toggle inline previews.',
+          'Usage: /img <path> to open an image, /img on|off to toggle inline and pasted previews.',
       }
     }
 
@@ -385,5 +516,41 @@ export const register: Register = on => {
     }
 
     return Box({ flexDirection: 'column', children: [row, ...previews] })
+  })
+
+  // Thumbnails of the images pasted into the draft, above the prompt.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.component !== 'AbovePrompt' || e.surface !== 'terminal' || e.props.hasSurvey) return next(e)
+    const images = await read($, pasted)
+    if (!isInlineOn || images.length === 0) return next(e)
+
+    const { Box, Text, Image } = $.ui.resolve(e)
+    await syncCellAspect($, e.viewport?.columns)
+    const shown = images.slice(0, THUMB_LIMIT)
+    const rows = Math.max(2, Math.min(THUMB_ROWS, e.props.maxRows - 2))
+    const columns = Math.max(4, Math.floor((e.props.bodyColumns - 2 - THUMB_GAP * (shown.length - 1)) / shown.length))
+
+    const thumbs = []
+    for (const { id, path } of shown) {
+      const tag = `[Image #${id}]`
+      const preview = await loadPicture($, path)
+      const picture = preview.ok
+        ? Image({ source: { png: preview.picture.png }, ...cellsFor(preview.picture, columns, rows), alt: tag })
+        : Text({ dimColor: true, children: [`no preview: ${preview.reason}`] })
+      thumbs.push(
+        Box({
+          key: `pasted-${id}`,
+          flexDirection: 'column',
+          children: [picture, Text({ dimColor: true, wrap: 'truncate-end', children: [tag] })],
+        }),
+      )
+    }
+    if (images.length > shown.length) {
+      thumbs.push(Text({ dimColor: true, children: [`+${images.length - shown.length} more`] }))
+    }
+
+    const band = Box({ key: 'pasted', flexDirection: 'row', columnGap: THUMB_GAP, paddingLeft: 2, children: thumbs })
+    const below = await next(e)
+    return below ? Box({ flexDirection: 'column', children: [band, below] }) : band
   })
 }

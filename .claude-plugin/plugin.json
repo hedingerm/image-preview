@@ -1,7 +1,7 @@
 {
   "name": "image-preview",
-  "version": "0.2.1",
-  "description": "Inline image previews in the terminal (Ghostty, kitty): under every image Claude reads, and on demand with /img",
+  "version": "0.3.0",
+  "description": "Inline image previews in the terminal (Ghostty, kitty): under every image Claude reads, above the prompt for pasted images, and on demand with /img",
   "author": {
     "name": "Manuel Hedinger"
   },
@@ -15,5 +15,6 @@
     "kitty",
     "terminal",
     "mod"
-  ]
+  ],
+  "types": "./types/index.d.ts"
 }
