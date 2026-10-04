@@ -201,14 +201,19 @@ test('a folded group centers its previews too', async ($, on) => {
   expect(boxes.some(b => b.props.alignItems === 'center' || b.props.justifyContent === 'center')).toBe(false)
 })
 
-// Claude Code's files for this test session: its images folder and what's in it
-const IMAGES = '/home/you/.claude/projects/-work-app/sess-1/images'
-function pasteFolder(on: On, files: string[], draft: { text: string }) {
-  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/you' : undefined }))
+// A session whose clipboard holds `clip` (what the mod's clipboard script prints) and whose draft is `draft`
+type Clip = { files?: string[]; png?: boolean }
+function pasteSession(on: On, session: string, clip: { now: Clip }, draft: { text: string }) {
+  on('env.get', (_$, e) => ({ value: e.name === 'TMPDIR' ? '/tmp' : undefined }))
   on('session.cwd', () => ({ value: '/work/app' }))
-  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.id', () => ({ value: session }))
   on('prompt.read', () => ({ value: { text: draft.text, cursor: draft.text.length } }))
-  on('fs.exists', (_$, e) => ({ value: e.path === IMAGES || files.includes(e.path) }))
+  on('process.run', (_$, e) => {
+    const out = e.argv[e.argv.length - 1] ?? ''
+    const { files, png } = clip.now
+    const stdout = e.argv[0] === 'osascript' ? JSON.stringify(files ? { files } : png ? { png: out } : {}) : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
   on('fs.stat', () => ({ value: { kind: 'file', size: 200, mtimeMs: 3, isLink: false } }))
   on('fs.read', () => ({ value: { base64: PNG } }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -226,20 +231,26 @@ const mountBand = ($: Parameters<TestBody>[0], surface: 'terminal' | 'desktop' =
     viewport: VIEW,
   })
 
+const thumbTags = async ($: Parameters<TestBody>[0]) =>
+  (await (await mountBand($)).findAll({ type: 'Image' })).map(t => t.props.alt)
+
 test('images pasted into the draft get thumbnails above the prompt', async ($, on) => {
   engine(on)
   const clock = mock.clock(on)
+  const clip: { now: Clip } = { now: {} }
   const draft = { text: '' }
-  pasteFolder(on, [`${IMAGES}/1.png`, `${IMAGES}/2.png`], draft)
+  pasteSession(on, 'sess-paste', clip, draft)
   await startSession($)
 
   await clock.advance(500)
-  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+  expect(await thumbTags($)).toEqual([])
 
-  draft.text = 'what is wrong here [Image #1] and [Image #2]'
+  clip.now = { png: true }
+  draft.text = 'what is wrong here [Image #1]'
   await clock.advance(500)
-  const band = await mountBand($)
-  const thumbs = await band.findAll({ type: 'Image' })
+  draft.text += ' and [Image #2]'
+  await clock.advance(500)
+  const thumbs = await (await mountBand($)).findAll({ type: 'Image' })
   expect(thumbs.map(t => t.props.alt)).toEqual(['[Image #1]', '[Image #2]'])
   // 2:1 picture in a thumbnail at most 6 rows tall
   expect(thumbs[0]?.props.rows).toBe(6)
@@ -248,31 +259,61 @@ test('images pasted into the draft get thumbnails above the prompt', async ($, o
   // deleting the placeholder removes the thumbnail
   draft.text = 'what is wrong here [Image #2]'
   await clock.advance(500)
-  expect((await (await mountBand($)).findAll({ type: 'Image' })).map(t => t.props.alt)).toEqual(['[Image #2]'])
+  expect(await thumbTags($)).toEqual(['[Image #2]'])
 })
 
-test('pasted thumbnails wait for the file, clear on submit and honor /img off', async ($, on) => {
+test('several copied files map onto their placeholders; one picture goes to the newest only', async ($, on) => {
   engine(on)
   const clock = mock.clock(on)
-  const files: string[] = []
-  const draft = { text: 'look [Image #1]' }
-  pasteFolder(on, files, draft)
+  // a text file copied along isn't one of the pasted images
+  const clip: { now: Clip } = { now: { files: ['/pics/a.png', '/pics/notes.txt', '/pics/b.png'] } }
+  const draft = { text: '' }
+  pasteSession(on, 'sess-files', clip, draft)
   await startSession($)
 
+  draft.text = '[Image #1] [Image #2]'
   await clock.advance(500)
-  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
-  files.push(`${IMAGES}/1.png`) // Claude Code finished writing it
+  expect(await thumbTags($)).toEqual(['[Image #1]', '[Image #2]'])
+
+  // two placeholders at once but one picture: no guessing for the older one
+  clip.now = { png: true }
+  draft.text += ' [Image #3] [Image #4]'
   await clock.advance(500)
-  expect(await (await mountBand($)).find({ type: 'Image' })).toBeDefined()
+  expect(await thumbTags($)).toEqual(['[Image #1]', '[Image #2]', '[Image #4]'])
+})
+
+test('a resumed draft and an empty clipboard get no thumbnails; submit and /img off clear them', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on)
+  const clip: { now: Clip } = { now: { png: true } }
+  const draft = { text: 'from before [Image #1]' }
+  pasteSession(on, 'sess-resume', clip, draft)
+  await startSession($)
+
+  // pasted before the session started: the clipboard holds something else by now
+  await clock.advance(500)
+  expect(await thumbTags($)).toEqual([])
+
+  // a paste with nothing on the clipboard isn't read again later
+  clip.now = {}
+  draft.text += ' [Image #2]'
+  await clock.advance(500)
+  clip.now = { png: true }
+  await clock.advance(500)
+  expect(await thumbTags($)).toEqual([])
+
+  draft.text += ' [Image #3]'
+  await clock.advance(500)
+  expect(await thumbTags($)).toEqual(['[Image #3]'])
   // the desktop app shows its own
   expect(await (await mountBand($, 'desktop')).find({ type: 'Image' })).toBeUndefined()
 
   await $.command.run(typed('off'))
-  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+  expect(await thumbTags($)).toEqual([])
   await $.command.run(typed('on'))
-  expect(await (await mountBand($)).find({ type: 'Image' })).toBeDefined()
+  expect(await thumbTags($)).toEqual(['[Image #3]'])
 
-  await $.prompt.submit({ text: 'look [Image #1]', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: draft.text, wait: false, origin: { kind: 'composer' } })
   draft.text = ''
-  expect(await (await mountBand($)).find({ type: 'Image' })).toBeUndefined()
+  expect(await thumbTags($)).toEqual([])
 })

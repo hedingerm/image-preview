@@ -32,8 +32,6 @@ const THUMB_ROWS = 6 // tallest thumbnail of a pasted image above the prompt
 const THUMB_LIMIT = 6 // thumbnails drawn above the prompt; the rest are counted
 const THUMB_GAP = 2 // cells between thumbnails
 const POLL_MS = 400 // how often the draft is checked for pasted images
-// Claude Code writes a pasted image to <config>/projects/<project>/<session>/images/<n>.<ext>
-const PASTE_EXTS = ['png', 'jpg', 'gif', 'webp']
 const PASTE_TAG = /\[Image #(\d+)\]/g
 
 // the images the draft in the prompt box refers to, drawn above it
@@ -49,9 +47,11 @@ let isInlineOn = true
 let cellAspect = DEFAULT_CELL_ASPECT
 let measuredAt: number | undefined // viewport columns at the last measurement
 let panePath: string | undefined
-// session id -> its images folder, and "session:n" -> the file of [Image #n]
-const imageDirs = new Map<string, string>()
+// Claude Code keeps a pasted image in memory only, so the mod saves its own copy from the clipboard
+// the moment the image's placeholder appears: "session:n" -> the file of [Image #n]
 const pastePaths = new Map<string, string>()
+const settled = new Set<string>() // "session:n" whose clipboard was read already, picture or not
+let syncGen = 0 // bumped by every sync and submit; a sync that finishes after a newer one doesn't write
 let poll: { cancel: () => void } | undefined // the timer that checks the draft
 
 // ---------- small helpers (no $) ----------
@@ -136,11 +136,6 @@ function pastedIds(text: string): number[] {
     if (!ids.includes(id)) ids.push(id)
   }
   return ids
-}
-
-/** Claude Code's folder name for a project: every character outside [a-zA-Z0-9] becomes '-'. */
-function projectSlug(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, '-')
 }
 
 function samePasted(a: readonly PastedImage[], b: readonly PastedImage[]): boolean {
@@ -250,49 +245,72 @@ async function previewFor($: EngineInterface, path: string, output: unknown): Pr
   return loadPicture($, path)
 }
 
-/** The folder this session's pasted images are written to, or undefined when there is none yet. */
-async function pasteDir($: EngineInterface, session: string): Promise<string | undefined> {
-  if (imageDirs.get(session)) return imageDirs.get(session)
-  const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || ((await $.env.get('HOME')) ?? '') + '/.claude').replace(/\/$/, '')
-  const projects = config + '/projects'
-  const guess = `${projects}/${projectSlug(await $.session.cwd())}/${session}/images`
-  let dir: string | undefined
-  if (await $.fs.exists(guess)) {
-    dir = guess
-  } else {
-    // a long or moved project path is named differently: look for the session's folder
-    try {
-      for (const entry of await $.fs.list(projects)) {
-        const candidate = `${projects}/${entry.name}/${session}/images`
-        if (entry.kind === 'dir' && (await $.fs.exists(candidate))) {
-          dir = candidate
-          break
-        }
-      }
-    } catch {
-      // no projects folder
-    }
+// Prints the clipboard's file paths as {"files": [...]} (files copied in Finder), or else writes its
+// picture to argv[0] as a PNG and prints {"png": path}; {} when it holds neither.
+const READ_CLIPBOARD = `
+ObjC.import('AppKit')
+function run(argv) {
+  const pb = $.NSPasteboard.generalPasteboard
+  const urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), $.NSDictionary.dictionaryWithObjectForKey(true, 'NSPasteboardURLReadingFileURLsOnlyKey'))
+  const files = []
+  for (let i = 0; urls && i < urls.count; i++) files.push(urls.objectAtIndex(i).path.js)
+  if (files.length > 0) return JSON.stringify({ files })
+  let data = pb.dataForType('public.png')
+  if (data.isNil()) {
+    const tiff = pb.dataForType('public.tiff')
+    if (!tiff.isNil()) data = $.NSBitmapImageRep.imageRepWithData(tiff).representationUsingTypeProperties(4, $())
   }
-  // remember a hit only: the folder appears with the session's first paste
-  if (dir) imageDirs.set(session, dir)
-  return dir
+  if (data.isNil() || !data.writeToFileAtomically(argv[0], true)) return '{}'
+  return JSON.stringify({ png: argv[0] })
 }
+`
 
-/** The file Claude Code wrote for `[Image #id]`, once it has. */
-async function pastePath($: EngineInterface, session: string, id: number): Promise<string | undefined> {
-  const key = `${session}:${id}`
-  const known = pastePaths.get(key)
-  if (known) return known
-  const dir = await pasteDir($, session)
-  if (!dir) return undefined
-  for (const ext of PASTE_EXTS) {
-    const path = `${dir}/${id}.${ext}`
-    if (await $.fs.exists(path)) {
-      pastePaths.set(key, path)
-      return path
+type Clipboard = { files: string[] } | { png: string } | undefined
+
+/** What's on the clipboard: copied files, or a picture saved to `out`. */
+async function readClipboard($: EngineInterface, out: string): Promise<Clipboard> {
+  try {
+    const run = await $.process.run(['osascript', '-l', 'JavaScript', '-e', READ_CLIPBOARD, out], { timeoutMs: 5000 })
+    if (run.exitCode === 0) {
+      const clip = JSON.parse(run.stdout.trim() || '{}') as { files?: string[]; png?: string }
+      if (clip.files?.length) return { files: clip.files }
+      return clip.png ? { png: clip.png } : undefined
+    }
+  } catch {
+    // not macOS
+  }
+  for (const argv of [['wl-paste', '--type', 'image/png'], ['xclip', '-selection', 'clipboard', '-t', 'image/png', '-o']]) {
+    try {
+      const run = await $.process.run(['sh', '-c', '"$@" > "$0"', out, ...argv], { timeoutMs: 5000 })
+      if (run.exitCode === 0 && (await $.fs.stat(out)).size > 0) return { png: out }
+    } catch {
+      // that tool isn't installed; try the next one
     }
   }
   return undefined
+}
+
+/**
+ * Saves the clipboard's pictures for the `[Image #n]` placeholders new to the draft. One picture
+ * goes to the newest placeholder; copied files go one each when their count matches, else the
+ * placeholders stay without a thumbnail rather than show the wrong one.
+ */
+async function capturePasted($: EngineInterface, session: string, ids: number[]): Promise<void> {
+  const fresh = ids.filter(id => !settled.has(`${session}:${id}`)).sort((a, b) => a - b)
+  if (fresh.length === 0) return
+  for (const id of fresh) settled.add(`${session}:${id}`)
+  if (!isInlineOn) return
+  const newest = fresh[fresh.length - 1] ?? 0
+  const tmp = ((await $.env.get('TMPDIR')) || '/tmp').replace(/\/$/, '')
+  const clip = await readClipboard($, `${tmp}/cc-image-preview-paste-${hash(session)}-${newest}.png`)
+  if (!clip) return
+  if ('png' in clip) {
+    pastePaths.set(`${session}:${newest}`, clip.png)
+    return
+  }
+  const images = clip.files.filter(f => IMAGE_EXT.test(f))
+  if (images.length === fresh.length) fresh.forEach((id, i) => images[i] && pastePaths.set(`${session}:${id}`, images[i]))
+  else if (images.length === 1 && images[0]) pastePaths.set(`${session}:${newest}`, images[0])
 }
 
 /** The draft in the prompt box; '' where there is none. */
@@ -306,15 +324,19 @@ async function draftText($: EngineInterface): Promise<string> {
 
 /** Points the band above the prompt at the images `draft` refers to. */
 async function syncPasted($: EngineInterface, draft: string): Promise<void> {
-  const ids = isInlineOn ? pastedIds(draft) : []
+  const gen = ++syncGen
+  const ids = pastedIds(draft)
   const found: PastedImage[] = []
   if (ids.length > 0) {
     const session = await $.session.id()
-    for (const id of ids) {
-      const path = await pastePath($, session, id)
+    await capturePasted($, session, ids)
+    for (const id of isInlineOn ? ids : []) {
+      const path = pastePaths.get(`${session}:${id}`)
       if (path) found.push({ id, path })
     }
   }
+  // an edit or submit arrived meanwhile: its draft is newer than ours
+  if (gen !== syncGen) return
   if (!samePasted(found, await read($, pasted))) await update($, pasted, () => found)
 }
 
@@ -371,6 +393,9 @@ export const register: Register = on => {
     })
     const saved = await $.store.get('inline')
     if (typeof saved === 'boolean') isInlineOn = saved
+    // placeholders already in a resumed draft were pasted long before: the clipboard has moved on
+    const session = await $.session.id()
+    for (const id of pastedIds(await draftText($))) settled.add(`${session}:${id}`)
     // A paste reaches the draft by more than one path, so the draft is also checked on a timer
     let isSyncing = false
     poll?.cancel()
@@ -395,6 +420,7 @@ export const register: Register = on => {
   // The draft leaves the box when it's sent
   on('prompt.submit', async ($, e, next) => {
     const result = await next(e)
+    syncGen++ // drops any sync still reading the sent draft
     await update($, pasted, () => [])
     return result
   })

@@ -28,7 +28,7 @@ Start a new session, then check it loaded with `/plugin` (Installed tab), or jus
 
 **Sizing:** a preview fills the available width and is at most `clamp(width / 2, 4, 20)` rows tall, centered under its row. Several images in one group each get the full size.
 
-**Pasted images:** Claude Code writes each pasted image to `~/.claude/projects/<project>/<session>/images/<N>.<ext>` (honoring `CLAUDE_CONFIG_DIR`). The mod watches the draft for `[Image #N]` placeholders, on every edit and on a 400 ms timer, and draws the matching files above the prompt, at most `THUMB_ROWS` rows tall and `THUMB_LIMIT` side by side.
+**Pasted images:** Claude Code keeps a pasted image in memory only, so the mod watches the draft for new `[Image #N]` placeholders (on every edit and on a 400 ms timer) and saves the clipboard's picture for it to the temp folder: with `osascript` on macOS, `wl-paste` or `xclip` on Linux. Files copied in Finder map onto the new placeholders one each. When several placeholders appear at once but the clipboard holds one picture, only the newest gets it, and placeholders already in a resumed draft get none. Thumbnails are at most `THUMB_ROWS` rows tall and `THUMB_LIMIT` side by side.
 
 **Proportions:** terminal cells aren't square, so the mod measures their real shape from the window's pixel size (`TIOCGWINSZ` on Claude Code's tty). It measures on the first preview and again whenever the column count changes, for example after a font zoom. This uses `python3`; without it, or when the terminal reports nonsense (tmux, ssh), the mod assumes cells twice as tall as wide.
 
