@@ -20,6 +20,19 @@ It's listed in [hedingerm/claude-plugins](https://github.com/hedingerm/claude-pl
 
 Start a new session, then check it loaded with `/plugin` (Installed tab), or just type `/img`.
 
+### Multiplexers
+
+Claude Code asks the terminal at startup whether it draws pictures. Inside a multiplexer it often concludes it can't and shows the dim alt text (`[Image #N]`, the file name) instead.
+
+- **herdr** passes pictures through (`terminal.kitty_graphics`, on by default), but Claude Code's check misses it. Force pictures on in `~/.claude/settings.json`, then restart Claude Code:
+
+  ```json
+  { "env": { "CLAUDE_CODE_FORCE_TERMINAL_IMAGES": "1" } }
+  ```
+
+  Only do this if every terminal you run Claude Code in draws pictures; elsewhere you'd get garbage instead of alt text.
+- **tmux / screen:** Claude Code turns pictures off inside them. Run it outside to see previews.
+
 ## How it works
 
 **Drawing:** pictures go through Claude Code's own `Image` element, which speaks the kitty graphics protocol. Terminals without it show the file name instead, so nothing breaks.
